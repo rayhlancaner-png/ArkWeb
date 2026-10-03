@@ -10,6 +10,6 @@ to idle priority on one core.
 | `ue3_natives.py <exe> <out.json>` | UE3 `UClassexecFunc` native table, mapped to function RVAs |
 | `strref.py <exe> <regex>` | Functions that reference strings matching the regex |
 | `callers.py <exe> <rva>...` | Direct call/jmp sites of a function |
-| `dis.py <exe> <rva>...` | Disassembles a function, with string, vtable and native-name hints |
+| `disasm.py <exe> <rva>...` | Disassembles a function, with string, vtable and native-name hints |
 
 Output goes to `../recon/`. Findings are in `../recon/PHASE0.md`.

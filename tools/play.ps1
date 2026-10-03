@@ -7,7 +7,7 @@
 # when you say so.
 param(
 	[switch]$NoGames,  # don't start the games
-	[switch]$Check     # only check Python, the packages and the streamer's imports (CI): no install, no games, no streamer
+	[switch]$Check     # only check Python, the packages and the streamer's code (CI): no install, no games, no streamer
 )
 
 $ErrorActionPreference = "Continue"
@@ -95,9 +95,11 @@ if ($LASTEXITCODE -ne 0) {
 Push-Location $Tools
 try {
 	if ($Check) {
-		& $pyExe @pyArgs gotham_stream.py --help *> $null
+		# the streamer's imports, and its compiled code (numba) on a box: 12 triangles
+		$out = & $pyExe @pyArgs -c "import numpy as np, gotham_stream as g; t = g.hull_tris(np.array([[x, y, z] for x in (0., 1.) for y in (0., 2.) for z in (0., 3.)])); print('hull triangles', len(t)); raise SystemExit(0 if len(t) == 12 else 1)" 2>&1
 		$ok = $LASTEXITCODE -eq 0
-		Say ("streamer imports " + $(if ($ok) { "ok" } else { "FAILED" }))
+		$out | ForEach-Object { Say "$_" $(if ($ok) { "Gray" } else { "Red" }) }
+		Say ("streamer " + $(if ($ok) { "ok" } else { "FAILED" }))
 		exit $(if ($ok) { 0 } else { 1 })
 	}
 

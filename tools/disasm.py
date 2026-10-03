@@ -1,4 +1,4 @@
-"""dis.py <exe> <rva> [<rva> ...]: disassemble the functions containing each RVA, with string,
+"""disasm.py <exe> <rva> [<rva> ...]: disassemble the functions containing each RVA, with string,
 RTTI-class and function-name hints on RIP-relative operands."""
 import json, os, re, sys
 from pe_tools import Image
