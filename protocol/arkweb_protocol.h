@@ -114,6 +114,8 @@ namespace arkweb::proto
 		kGuestAnchored = 1u << 2,   // heroPos is in Arkham's frame (Gotham loaded with an .origin)
 		kGuestSky = 1u << 3,        // Gotham is placed high above New York and the hero jumped up onto it
 		kGuestJumpFailed = 1u << 4, // the jump onto Gotham didn't hold (the streamer falls back to ground placement)
+		kGuestMouseLook = 1u << 5,  // the real mouse reaches Spider-Man's camera (his raw input in the background): with the
+		                            // view his camera, the host doesn't steer it for keyboard play either
 	};
 
 	struct GuestState

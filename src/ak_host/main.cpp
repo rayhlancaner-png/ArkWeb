@@ -7,6 +7,7 @@
 #include "../common/coords.h"
 #include "../common/link.h"
 #include "devcmd.h"
+#include "motion.h"
 #include "pose.h"
 #include "ue3.h"
 
@@ -410,8 +411,10 @@ namespace
 	// ---- player input -> the guest's virtual pad (while Batman is the puppet) ---------------------------
 	// A connected controller is forwarded whole (the guest serves it as Spider-Man's XInput pad);
 	// otherwise, while Arkham is in front, the keyboard: WASD = left stick, Space = jump (A), Left Shift
-	// = swing (right trigger), Left Ctrl = dodge (B) - Spider-Man's own defaults. The camera direction
-	// goes along so the guest can turn Spider-Man's camera the same way (movement is camera relative).
+	// = swing (right trigger), Left Ctrl = dodge (B) - Spider-Man's own defaults. The mouse doesn't go
+	// through here: the guest gives it to Spider-Man's camera itself (sm_guest, "the real mouse").
+	// Only while Arkham's own camera is the one shown does the camera direction go along, for the guest
+	// to turn Spider-Man's camera the same way (movement is camera relative).
 	constexpr int kPlayerCamera = 0x478;  // Engine.PlayerController.PlayerCamera
 	constexpr int kCameraPovRotation = 0x580;  // Camera.CameraCache.POV.Rotation (pitch, yaw, roll)
 	constexpr int kCameraPovFov = 0x58C;       // Camera.CameraCache.POV.FOV (degrees, horizontal)
@@ -421,7 +424,9 @@ namespace
 
 	bool ArkhamInFront();
 
-	void PublishPad(uintptr_t a_controller, bool a_active, bool a_cameraOnly = false)
+	// a_spiderView: Arkham shows Spider-Man's camera this tick; a_guestMouse: the guest's mouse look works. Returns
+	// whether Spider-Man's camera is steered toward Arkham's (kPadCamera went out).
+	bool PublishPad(uintptr_t a_controller, bool a_active, bool a_cameraOnly, bool a_spiderView, bool a_guestMouse)
 	{
 		if (!g_xinputGetState) {
 			static bool tried = false;
@@ -456,9 +461,14 @@ namespace
 				if (down(VK_LCONTROL)) p.buttons |= XINPUT_GAMEPAD_B;
 				if (down(VK_LSHIFT)) p.rightTrigger = 255;
 			}
-			// With a controller and the view mimicking Spider-Man's camera, his camera is the one in charge:
-			// the right stick reaches it unchanged (no steering toward Arkham's camera, which isn't shown).
-			bool      steer = !(devcmd::g_mimicCamera && (p.flags & proto::kPadAnalog));
+			// With the view Spider-Man's camera, his camera is the one in charge: the right stick reaches it
+			// unchanged, and so does the mouse (the guest's raw input). Steering it toward Arkham's own camera -
+			// not shown, behind a puppet, turning by itself - is what made it pull back while swinging and spin
+			// with the mouse: the two cameras fought. Keyboard play still gets it if the guest's mouse look
+			// doesn't work (or is off: `cam mouse off`), else nothing would turn the camera. Never in a fight:
+			// Arkham's camera is the view and Spider-Man's is overwritten with it.
+			bool      analog = (p.flags & proto::kPadAnalog) != 0;
+			bool      steer = !a_cameraOnly && (!a_spiderView || (!analog && !a_guestMouse));
 			uintptr_t cam = ReadOr<uintptr_t>(a_controller + kPlayerCamera, 0);
 			int32_t   rot[3] = {};
 			if (steer && cam && SafeRead(rot, reinterpret_cast<const void*>(cam + kCameraPovRotation), sizeof(rot))) {
@@ -480,49 +490,20 @@ namespace
 		last = p;
 		p.packet = g_padPacket;
 		SeqWrite(g_link.Pad(), p);
+		return (p.flags & proto::kPadCamera) != 0;
 	}
 
-	// ---- Spider-Man's motion, smoothed --------------------------------------------------------------------
-	// The guest publishes one snapshot per Spider-Man frame (hero and camera together), stamped with that
-	// frame's QPC time - the same clock here. Arkham ticks at its own rate, so each tick samples the motion
-	// a little in the past (about one Spider-Man frame plus the publish delay) and interpolates between the
-	// two frames around that moment: Batman and the view move smoothly, and together. Past the newest frame
-	// (a hitch) it extrapolates for up to 50 ms.
-	struct Snap
-	{
-		int64_t qpc;
-		double  pos[3];
-		float   fwd[3];
-		double  cam[3];
-		float   camF[3], camU[3];
-		float   fovY;  // Spider-Man's vertical field of view, degrees (0 = not known)
-		bool    camOk;
-	};
-	using Pose = Snap;
-	constexpr int kSnaps = 32;
-	Snap          g_snaps[kSnaps];
-	int           g_snapCount = 0, g_snapNext = 0;
-	double        g_frameDt = 1.0 / 60.0;  // average time between Spider-Man frames, s
-	double        g_qpcFreq = 0.0;
-	FVector       g_viewLoc{};  // this tick's view (OverrideView)
-	FRotator      g_viewRot{};
-	bool          g_viewValid = false;
-	float         g_viewFovY = 0.0f;  // ... and its vertical field of view (0: Arkham's own)
-
-	const Snap& SnapAt(int a_i) { return g_snaps[(g_snapNext - g_snapCount + a_i + 2 * kSnaps) % kSnaps]; }  // 0 = oldest
+	// ---- Spider-Man's motion, smoothed (motion.h) ----------------------------------------------------------
+	using Pose = motion::Snap;
+	motion::Buffer g_motion;
+	FVector        g_viewLoc{};  // this tick's view (OverrideView)
+	FRotator       g_viewRot{};
+	bool           g_viewValid = false;
+	float          g_viewFovY = 0.0f;  // ... and its vertical field of view (0: Arkham's own)
 
 	void PushSnap(const proto::GuestState& a_gs)
 	{
-		if (!a_gs.qpc) return;
-		if (g_snapCount) {
-			const Snap& last = SnapAt(g_snapCount - 1);
-			if (a_gs.qpc <= last.qpc) return;  // the same frame again
-			double dt = (a_gs.qpc - last.qpc) / g_qpcFreq;
-			if (dt > 0.0 && dt < 0.2) g_frameDt = g_frameDt * 0.9 + dt * 0.1;
-		}
-		Snap& s = g_snaps[g_snapNext];
-		g_snapNext = (g_snapNext + 1) % kSnaps;
-		if (g_snapCount < kSnaps) ++g_snapCount;
+		Pose s{};
 		s.qpc = a_gs.qpc;
 		for (int i = 0; i < 3; ++i) {
 			s.pos[i] = a_gs.heroPos[i], s.fwd[i] = a_gs.heroRot[6 + i];
@@ -530,58 +511,14 @@ namespace
 		}
 		s.camOk = s.camF[0] * s.camF[0] + s.camF[1] * s.camF[1] + s.camF[2] * s.camF[2] > 0.5f;
 		s.fovY = a_gs.camFovYDeg;
-	}
-
-	void Normalize(float a_v[3])
-	{
-		float l = std::sqrt(a_v[0] * a_v[0] + a_v[1] * a_v[1] + a_v[2] * a_v[2]);
-		if (l > 1e-6f) a_v[0] /= l, a_v[1] /= l, a_v[2] /= l;
-	}
-
-	void Blend(const Snap& a_a, const Snap& a_b, double a_t, Pose& a_out)
-	{
-		const float t = static_cast<float>(a_t);
-		for (int i = 0; i < 3; ++i) {
-			a_out.pos[i] = a_a.pos[i] + (a_b.pos[i] - a_a.pos[i]) * a_t;
-			a_out.cam[i] = a_a.cam[i] + (a_b.cam[i] - a_a.cam[i]) * a_t;
-			a_out.fwd[i] = a_a.fwd[i] + (a_b.fwd[i] - a_a.fwd[i]) * t;
-			a_out.camF[i] = a_a.camF[i] + (a_b.camF[i] - a_a.camF[i]) * t;
-			a_out.camU[i] = a_a.camU[i] + (a_b.camU[i] - a_a.camU[i]) * t;
-		}
-		Normalize(a_out.fwd), Normalize(a_out.camF), Normalize(a_out.camU);
-		a_out.camOk = a_a.camOk && a_b.camOk;
-		a_out.fovY = a_a.fovY > 0.0f && a_b.fovY > 0.0f ? a_a.fovY + (a_b.fovY - a_a.fovY) * t : a_b.fovY;
-		a_out.qpc = a_a.qpc + static_cast<int64_t>((a_b.qpc - a_a.qpc) * a_t);
+		g_motion.Push(s);
 	}
 
 	bool SamplePose(Pose& a_out)
 	{
-		if (!g_snapCount) return false;
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
-		double      delay = std::clamp(g_frameDt + 0.008, 0.010, 0.060);
-		int64_t     t = now.QuadPart - static_cast<int64_t>(delay * g_qpcFreq);
-		const Snap& newest = SnapAt(g_snapCount - 1);
-		if (t >= newest.qpc) {
-			a_out = newest;
-			if (g_snapCount < 2) return true;
-			const Snap& prev = SnapAt(g_snapCount - 2);
-			double span = (newest.qpc - prev.qpc) / g_qpcFreq;
-			double ahead = std::min((t - newest.qpc) / g_qpcFreq, 0.05);
-			double step = std::hypot(newest.pos[0] - prev.pos[0], newest.pos[1] - prev.pos[1], newest.pos[2] - prev.pos[2]);
-			if (span > 0.0 && span < 0.2 && step < 20.0) Blend(prev, newest, 1.0 + ahead / span, a_out);  // not across a teleport
-			return true;
-		}
-		for (int i = g_snapCount - 2; i >= 0; --i) {
-			const Snap& a = SnapAt(i);
-			const Snap& b = SnapAt(i + 1);
-			if (a.qpc <= t) {
-				Blend(a, b, static_cast<double>(t - a.qpc) / static_cast<double>(b.qpc - a.qpc), a_out);
-				return true;
-			}
-		}
-		a_out = SnapAt(0);  // older than everything we have
-		return true;
+		return g_motion.Sample(now.QuadPart, a_out);
 	}
 
 	// One game-thread tick (after the player controller's own PlayerTick ran).
@@ -621,10 +558,9 @@ namespace
 				Log("guest linked: driving Batman (guest frame %llu)", static_cast<unsigned long long>(gs.frame));
 				SetPhysics(pawn, PHYS_None);
 				g_driving = true;
-				g_snapCount = g_snapNext = 0;  // no history from before this link
 				LARGE_INTEGER f;
 				QueryPerformanceFrequency(&f);
-				g_qpcFreq = static_cast<double>(f.QuadPart);
+				g_motion.Reset(static_cast<double>(f.QuadPart));  // no history from before this link
 			}
 			PushSnap(gs);
 			Pose pose;
@@ -663,7 +599,14 @@ namespace
 		overlay::g_puppet.store(g_driving || g_combat, std::memory_order_relaxed);
 		UpdateBatmanHidden(pawn, g_driving || g_combat);
 
-		PublishPad(a_controller, g_driving || g_combat, g_combat);
+		bool spiderView = devcmd::g_mimicCamera && g_driving && g_viewValid;  // the view is Spider-Man's camera (OverrideView)
+		bool steered = PublishPad(a_controller, g_driving || g_combat, g_combat, spiderView, (gs.flags & proto::kGuestMouseLook) != 0);
+		if (spiderView && !steered) {
+			// Arkham's own camera (not shown) is turned the same way, so a fight - where it becomes the view - starts
+			// looking where Spider-Man did; its own turning this tick (the mouse, the stick) is replaced
+			FRotator ctl{ g_viewRot.pitch & 0xFFFF, g_viewRot.yaw & 0xFFFF, 0 };
+			SafeWrite(reinterpret_cast<void*>(a_controller + kActorRotation), &ctl, sizeof(ctl));
+		}
 
 		proto::HostState hs{};
 		hs.flags = proto::kHostInGame | (g_driving ? proto::kHostDrivePuppet : 0) | (g_combat ? proto::kHostCombat : 0);
@@ -767,9 +710,9 @@ namespace
 		}
 		if (fov > 10.0f && fov < 170.0f) overlay::g_akFovDeg.store(fov, std::memory_order_relaxed);
 		if (++g_viewOverrides % 3000 == 1) {
-			Log("view: Spider-Man's camera at (%.0f %.0f %.0f) UU, pitch %d yaw %d roll %d (%llu views so far, Spider-Man frames %.1f ms apart)",
+			Log("view: Spider-Man's camera at (%.0f %.0f %.0f) UU, pitch %d yaw %d roll %d (%llu views so far, Spider-Man frames %.1f ms apart, shown %.1f ms late)",
 				g_viewLoc.x, g_viewLoc.y, g_viewLoc.z, g_viewRot.pitch, g_viewRot.yaw, g_viewRot.roll, static_cast<unsigned long long>(g_viewOverrides),
-				g_frameDt * 1000.0);
+				g_motion.FrameDt() * 1000.0, g_motion.Delay() * 1000.0);
 		}
 	}
 

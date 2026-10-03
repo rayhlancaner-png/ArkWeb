@@ -9,9 +9,10 @@ https://www.youtube.com/watch?v=O6Mkm_NGCX8
 Spider-Man's web swinging in Batman: Arkham Knight's Gotham.
 
 ArkWeb runs **Marvel's Spider-Man Remastered** alongside **Batman: Arkham Knight**. You play Spider-Man's
-own movement (swinging, wall running, wall crawling, point launches) with a controller while looking at
-Arkham Knight. Gotham's collision is streamed into Spider-Man's physics world, so he swings off and runs on
-Gotham's buildings. His own rendered frame is cut out and drawn into Arkham's view in Batman's place.
+own movement (swinging, wall running, wall crawling, point launches) with a controller, or keyboard and
+mouse, while looking at Arkham Knight. Gotham's collision is streamed into Spider-Man's physics world, so he
+swings off and runs on Gotham's buildings. His own rendered frame is cut out and drawn into Arkham's view in
+Batman's place.
 
 The architecture follows [SkyCraft](https://github.com/chasmlol/SkyCraft): a hidden guest game drives the
 moveset, and the host game shows it.
@@ -23,7 +24,7 @@ known issues below.
 
 | Part | What it does |
 |---|---|
-| `src/sm_guest/` → `winmm.dll` in Spider-Man | Publishes the hero and camera, plays a virtual controller, fakes window focus, and builds Gotham's collision (Havok compressed meshes) about 2 km above New York so New York's own ledges are out of reach. It also patches the hero's transition manager for zip-to-point and perching, and captures Spider-Man's frame (D3D12) for the host. |
+| `src/sm_guest/` → `winmm.dll` in Spider-Man | Publishes the hero and camera, plays a virtual controller, lets the mouse turn Spider-Man's camera, fakes window focus, and builds Gotham's collision (Havok compressed meshes) about 2 km above New York so New York's own ledges are out of reach. It also patches the hero's transition manager for zip-to-point and perching, and captures Spider-Man's frame (D3D12) for the host. |
 | `src/ak_host/` → `dinput8.dll` in Arkham Knight | Drives Batman as a hidden puppet at Spider-Man's position, mimics Spider-Man's camera, and draws the captured frame (D3D11). It also scans Gotham with the game's own traces and exports its PhysX statics and grapple points. |
 | `protocol/`, `src/common/` | Shared-memory link (`Local\ArkWeb_v1`): seqlock state slots, rings and coordinate conversion (UE3 Z-up cm ↔ Spider-Man Y-up m) |
 | `tools/gotham_stream.py` | The streamer. It follows the hero, asks Arkham for tile scans (50 m tiles) and PhysX exports, builds collision tiles and swing hints, and sends them to Spider-Man. |
@@ -52,14 +53,14 @@ same pose transfer in Python, for checking it offline.
 - **Marvel's Spider-Man Remastered v4.0630** (Steam). Everything is bound to that build's addresses; other
   builds refuse to hook.
 - **Batman: Arkham Knight** (Steam)
-- An Xbox-style controller
+- An Xbox-style controller, or a keyboard and mouse
 - Visual Studio 2019 Build Tools (x64 C++) and the Windows 10 SDK (for `fxc`)
 - Python 3.12 with `numpy`, `scipy`, `numba`, `pefile` and `capstone` (for the streamer and tools)
 
 ## Build and install
 
 1. Edit the game paths in `install.bat` and `uninstall.bat`.
-2. Run `build.bat`. It builds both DLLs and the link test into `bin\`, at low priority on one core.
+2. Run `build.bat`. It builds both DLLs and the tests into `bin\`, at low priority on one core.
 3. Close both games, then run `install.bat`. `uninstall.bat` removes the DLLs again.
 
 `arkweb.ini` next to either DLL can override `[ArkWeb] LogDir=` and a few switches (see `PHASE1.md`).
@@ -72,7 +73,27 @@ Logs go to `logs\`.
 1. Start both games and load into the open world in each. Keep Arkham Knight in front.
 2. Stand still with Spider-Man, then start the streamer: `cd tools` and `python gotham_stream.py`.
    It waits for both games, builds the area around you and lifts Spider-Man onto Gotham.
-3. Play with the controller. If you restart the streamer while still in game, use `--resume`.
+3. Play with the controller, or keyboard and mouse. If you restart the streamer while still in game, use
+   `--resume`.
+
+### Keyboard and mouse
+
+With no controller connected, Arkham's keyboard drives Spider-Man while Arkham Knight is in front:
+
+| Input | Spider-Man |
+|---|---|
+| W A S D | move |
+| Space | jump |
+| Left Shift | swing |
+| Left Ctrl | dodge |
+| Mouse | his camera |
+
+The mouse turns Spider-Man's camera the way it does in Spider-Man itself (his mouse sensitivity setting
+applies): the guest lets Spider-Man read the mouse in the background. Clicks and the wheel stay with Arkham.
+In a fight Arkham's own camera is the view, so the mouse turns that one. Zip to point and the other buttons
+need a controller. `cam mouse` in `logs\sm_cmd.txt` reports what reaches the camera. `cam mouse off` (or a
+Spider-Man that can't read the mouse in the background) brings back the old way: his camera steered toward
+Arkham's hidden one.
 
 **Your Arkham Knight save follows Batman.** Arkham autosaves while Batman is the puppet, so don't leave
 Spider-Man under the map. The host refuses to move Batman far below the streets, and `tp x y z` (feet, UU)
@@ -85,7 +106,7 @@ go to `logs\sm_guest.log` and `logs\ak_host.log`.
 
 | Game | Examples |
 |---|---|
-| Spider-Man | `hero tp 0 200 0`, `zip status`, `zip perch on\|off`, `gotham stream status`, `gotham surface <hex>`, `cap status` |
+| Spider-Man | `hero tp 0 200 0`, `zip status`, `zip perch on\|off`, `gotham stream status`, `gotham surface <hex>`, `cap status`, `cam mouse [on\|off]` |
 | Arkham Knight | `tp x y z`, `batman hide\|show\|auto`, `overlay on\|off`, `overlay gamma <g>`, `shot`, `cam mimic on\|off`, `px info` |
 
 ## Known issues
@@ -107,7 +128,7 @@ go to `logs\sm_guest.log` and `logs\ak_host.log`.
 |---|---|
 | `src/`, `protocol/` | The two DLLs and the shared link |
 | `tools/` | The streamer and reverse-engineering scripts (`tools/README.md`) |
-| `tests/` | Offline link test |
+| `tests/` | Offline link and motion-smoothing tests |
 | `recon/PHASE0*.md`, `PHASE1.md`, `PHASE2.md` | Findings and phase notes, with addresses |
 | `recon_dll/` | The passive recon probes used at the start |
 

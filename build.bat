@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul || exit /b 1
 for %%d in (bin bin\obj\ak bin\obj\sm bin\obj\test bin\ak bin\sm) do if not exist %%d mkdir %%d
-del /q bin\ak\dinput8.dll bin\sm\winmm.dll bin\link_test.exe src\sm_guest\capture_cs.h src\ak_host\overlay_vs.h src\ak_host\overlay_ps.h 2>nul
+del /q bin\ak\dinput8.dll bin\sm\winmm.dll bin\link_test.exe bin\motion_test.exe src\sm_guest\capture_cs.h src\ak_host\overlay_vs.h src\ak_host\overlay_ps.h 2>nul
 set FXC=C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\fxc.exe
 start "" /low /affinity 1 /wait /b "%FXC%" /nologo /T cs_5_0 /E main /O3 /Vn g_captureCs /Fh src\sm_guest\capture_cs.h src\sm_guest\capture_cs.hlsl
 if not exist src\sm_guest\capture_cs.h exit /b 1
@@ -19,4 +19,8 @@ start "" /low /affinity 1 /wait /b cl %OPTS% /LD src\sm_guest\main.cpp /Fobin\ob
 if not exist bin\sm\winmm.dll exit /b 1
 start "" /low /affinity 1 /wait /b cl %OPTS% tests\link_test.cpp /Fobin\obj\test\ /Febin\link_test.exe
 if not exist bin\link_test.exe exit /b 1
+start "" /low /affinity 1 /wait /b cl %OPTS% tests\motion_test.cpp /Fobin\obj\test\ /Febin\motion_test.exe
+if not exist bin\motion_test.exe exit /b 1
+rem the motion test is offline (link_test opens the live shared memory: run that one by hand)
+bin\motion_test.exe || exit /b 1
 echo BUILD OK

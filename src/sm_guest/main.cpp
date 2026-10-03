@@ -141,6 +141,8 @@ namespace
 	using GetProcAddressFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 	GetProcAddressFn g_realGetProcAddress = nullptr;
 
+	FARPROC RegisterRawInputProc(FARPROC a_real);  // the real mouse (below)
+
 	FARPROC WINAPI GetProcAddressDetour(HMODULE a_mod, LPCSTR a_name)
 	{
 		FARPROC real = g_realGetProcAddress(a_mod, a_name);
@@ -156,6 +158,7 @@ namespace
 			Log("D3D12CreateDevice from %s -> capture hooks", mod);
 			return reinterpret_cast<FARPROC>(&capture::CreateDeviceDetour);
 		}
+		if (reinterpret_cast<uintptr_t>(a_name) >= 0x10000 && !strcmp(a_name, "RegisterRawInputDevices")) return RegisterRawInputProc(real);
 		if (!strstr(mod, "xinput")) return real;
 		if (reinterpret_cast<uintptr_t>(a_name) == 100) {  // XInputGetStateEx (ordinal)
 			g_realGetStateEx = reinterpret_cast<XInputGetStateFn>(real);
@@ -282,12 +285,28 @@ namespace
 	std::atomic<uint64_t> g_fakeServed{ 0 };
 
 	using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
-	GetRawInputDataFn g_realGetRawInputData = nullptr;
+	GetRawInputDataFn      g_realGetRawInputData = nullptr;
+	std::atomic<HRAWINPUT> g_sinkInput{ nullptr };  // the real mouse's background message the game is reading now ("the real mouse")
+
+	// That message as the game reads it: foreground input, and movement only - clicks and the wheel are Arkham's.
+	void AsForeground(RAWINPUT* a_ri, UINT a_bytes)
+	{
+		if (a_bytes < sizeof(RAWINPUTHEADER)) return;
+		a_ri->header.wParam = RIM_INPUT;
+		if (a_ri->header.dwType == RIM_TYPEMOUSE && a_bytes >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
+			a_ri->data.mouse.ulButtons = 0;  // usButtonFlags and usButtonData
+			a_ri->data.mouse.ulRawButtons = 0;
+		}
+	}
 
 	UINT WINAPI GetRawInputDataDetour(HRAWINPUT a_h, UINT a_cmd, LPVOID a_data, PUINT a_size, UINT a_hdr)
 	{
 		uintptr_t h = reinterpret_cast<uintptr_t>(a_h);
-		if ((h & kFakeMask) != kFakeTag) return g_realGetRawInputData(a_h, a_cmd, a_data, a_size, a_hdr);
+		if ((h & kFakeMask) != kFakeTag) {
+			UINT r = g_realGetRawInputData(a_h, a_cmd, a_data, a_size, a_hdr);
+			if (a_data && r != static_cast<UINT>(-1) && a_h == g_sinkInput.load(std::memory_order_relaxed)) AsForeground(static_cast<RAWINPUT*>(a_data), r);
+			return r;
+		}
 		const FakeKey& k = g_fake[h & 0xFF];
 		RAWINPUT ri{};
 		if (k.mouse) {
@@ -364,10 +383,12 @@ namespace
 			g_scan[2], g_scan[3], g_scan[4], g_scan[5], g_scan[6], g_keyboardDevice, g_mouseDevice);
 	}
 
-	// ---- camera steering: Spider-Man's movement and swings are relative to ITS camera, so the camera is
-	// turned (injected mouse moves) to the yaw the host camera has. Hero::HeroCameraManager +0x744 holds
-	// the camera matrix (rows side / up / forward / position, 4-byte aligned). Mouse counts per radian are
-	// calibrated once (a known move while nothing else turns the camera), then a P-controller steers.
+	// ---- camera steering: Spider-Man's movement and swings are relative to ITS camera, so while Arkham shows
+	// its own camera (`cam mimic off` in Arkham: the host sends kPadCamera) the camera is turned (injected mouse
+	// moves) to the yaw the host camera has. While Arkham shows Spider-Man's camera nothing steers it: the stick
+	// and the mouse turn it directly ("the real mouse" below). Hero::HeroCameraManager +0x744 holds the camera
+	// matrix (rows side / up / forward / position, 4-byte aligned). Mouse counts per radian are calibrated once
+	// (a known move while nothing else turns the camera), then a P-controller steers.
 	constexpr uintptr_t kHeroCameraManagerVtable = 0x38b1dd0;
 	constexpr int       kHeroCameraManagerSlots = 38;
 	constexpr int       kCameraMatrix = 0x744;
@@ -472,11 +493,179 @@ namespace
 		}
 	}
 
+	// ---- the real mouse: Spider-Man's own mouse look ----------------------------------------------------------
+	// While Arkham shows Spider-Man's camera, that camera is the player's, turned the way it is when Spider-Man is
+	// played on its own: by the mouse's raw input. (Steering it toward Arkham's own camera instead - not shown,
+	// behind a puppet, turning by itself - fought Spider-Man's swing camera: it pulled back and spun.) Windows sends
+	// raw input only to the window in front, which is Arkham's, so while a host is linked the game's mouse
+	// registration gets RIDEV_INPUTSINK on its window, and the window receives the mouse in the background too
+	// (WM_INPUT, RIM_INPUTSINK). Those messages go on to the game as foreground input, movement only (AsForeground),
+	// while Arkham is in front and ticking, the host isn't steering the camera and there's no fight (Arkham's camera
+	// is the view then); else they are dropped. Only the window thread changes the registration: EnsureMouseSink,
+	// every second while linked (also onto a window the game has made anew), and RestoreMouseSink, which gives the
+	// game its own back when the host goes - a Spider-Man played on its own works as before. The guest tells the host
+	// whether this works (kGuestMouseLook); if it doesn't, the host steers the camera for keyboard play as before.
+	// `cam mouse on|off` from sm_cmd.txt.
+	using RegisterRawInputFn = BOOL(WINAPI*)(PCRAWINPUTDEVICE, UINT, UINT);
+	RegisterRawInputFn    g_realRegisterRawInput = nullptr;
+	UINT                  g_sinkMsg = 0;                // registered message to the window thread: wParam 0 add the background, 1 give it back
+	std::atomic<bool>     g_hostLinked{ false };        // the worker's: a host's heartbeat is fresh
+	std::atomic<bool>     g_mouseLookOn{ true };        // `cam mouse on|off`
+	std::atomic<bool>     g_mouseLook{ false };         // the worker's verdict (every 4 ms): background moves turn his camera
+	std::atomic<int>      g_sinkState{ 0 };             // the game's mouse registration: 0 as the game made it, 1 with the background, -1 can't be
+	std::atomic<uint32_t> g_sinkAdds{ 0 };              // times EnsureMouseSink added it
+	std::atomic<uint64_t> g_mouseMoves{ 0 }, g_mouseDropped{ 0 };
+	SRWLOCK               g_sinkLock = SRWLOCK_INIT;
+	RAWINPUTDEVICE        g_gameMouse{};                // the game's own mouse registration, as it asked (given back without a host)
+	bool                  g_gameMouseKnown = false;
+	HWND                  g_sinkWindow = nullptr;       // the window the background registration is ours on
+
+	// The mouse's registration now (a_found false: none); false if the registrations can't be read.
+	bool RegisteredMouse(RAWINPUTDEVICE& a_out, bool& a_found)
+	{
+		std::vector<RAWINPUTDEVICE> devs(16);
+		UINT                        n = 16, got;
+		while ((got = GetRegisteredRawInputDevices(devs.data(), &n, sizeof(RAWINPUTDEVICE))) == static_cast<UINT>(-1) &&
+			GetLastError() == ERROR_INSUFFICIENT_BUFFER && n > devs.size() && n <= 1024)
+			devs.resize(n);
+		a_found = false;
+		if (got == static_cast<UINT>(-1)) return false;
+		for (UINT i = 0; i < got && !a_found; ++i) {
+			if (devs[i].usUsagePage == 0x01 && devs[i].usUsage == 0x02) a_out = devs[i], a_found = true;
+		}
+		return true;
+	}
+
+	// The game's own registrations (it may register again later, e.g. as its cursor mode changes): made as it asks and
+	// noted; the window thread adds the background again.
+	BOOL WINAPI RegisterRawInputDetour(PCRAWINPUTDEVICE a_devs, UINT a_n, UINT a_size)
+	{
+		BOOL ok = g_realRegisterRawInput(a_devs, a_n, a_size);
+		for (UINT i = 0; ok && a_devs && a_size == sizeof(RAWINPUTDEVICE) && i < a_n; ++i) {
+			if (a_devs[i].usUsagePage != 0x01 || a_devs[i].usUsage != 0x02) continue;
+			AcquireSRWLockExclusive(&g_sinkLock);
+			g_gameMouse = a_devs[i], g_gameMouseKnown = !(a_devs[i].dwFlags & RIDEV_REMOVE), g_sinkWindow = nullptr;
+			ReleaseSRWLockExclusive(&g_sinkLock);
+			g_sinkState = 0;
+			if (g_hostLinked && g_window && g_sinkMsg) PostMessageW(g_window, g_sinkMsg, 0, 0);
+		}
+		return ok;
+	}
+
+	// The game asking GetProcAddress for it gets the detour too.
+	FARPROC RegisterRawInputProc(FARPROC a_real)
+	{
+		if (!g_realRegisterRawInput) g_realRegisterRawInput = reinterpret_cast<RegisterRawInputFn>(a_real);
+		return reinterpret_cast<FARPROC>(&RegisterRawInputDetour);
+	}
+
+	// Window thread (g_sinkMsg 0: every second while linked, and after the game registers): the game's mouse registration
+	// with the background on this window. Added if it lacks it (the game registered before the link, or again since);
+	// moved here if ours is on a window that's gone (the game makes its window anew at times, and Windows may drop a
+	// registration with its window).
+	void EnsureMouseSink(HWND a_wnd)
+	{
+		if (!g_hostLinked || !g_realGetRawInputData || !g_realRegisterRawInput) return;
+		RAWINPUTDEVICE m{}, d{};
+		bool           found = false, todo = false;
+		if (!RegisteredMouse(m, found)) {
+			if (g_sinkState.exchange(-1) != -1) Log("mouse: the game's raw input registrations can't be read (error %lu)", GetLastError());
+			return;
+		}
+		bool sink = found && (m.dwFlags & RIDEV_INPUTSINK), deadTarget = found && m.hwndTarget && !IsWindow(m.hwndTarget);
+		AcquireSRWLockExclusive(&g_sinkLock);
+		if (sink && m.hwndTarget == a_wnd) {
+			g_sinkState = 1;  // in place
+		} else if (sink && (m.hwndTarget == g_sinkWindow || deadTarget)) {
+			d = g_gameMouseKnown ? g_gameMouse : m;  // ours, for a window that's gone: the game's own, onto this one
+			d.hwndTarget = nullptr, d.dwFlags &= ~RIDEV_INPUTSINK, todo = true;
+		} else if (found && (m.dwFlags & (RIDEV_INPUTSINK | RIDEV_EXINPUTSINK))) {
+			if (g_sinkState.exchange(-1) != -1) Log("mouse: the game's own mouse comes in the background elsewhere (flags %lx, window %p)", m.dwFlags, m.hwndTarget);
+		} else if (found) {
+			g_gameMouse = m, g_gameMouseKnown = true;  // the game's own, as it is now
+			d = m, todo = true;
+			if (deadTarget) d.hwndTarget = nullptr;  // for a window that's gone: this one
+		} else if (g_sinkWindow && g_gameMouseKnown) {
+			d = g_gameMouse;  // ours went with its window: the game's own again, on this one
+			d.hwndTarget = nullptr, d.dwFlags &= ~RIDEV_INPUTSINK, todo = true;
+		}
+		if (todo) {
+			RAWINPUTDEVICE from = d;
+			if (d.hwndTarget && d.hwndTarget != a_wnd) {
+				if (g_sinkState.exchange(-1) != -1) Log("mouse: the game's mouse registration (flags %lx) is for another window (%p)", d.dwFlags, d.hwndTarget);
+			} else {
+				d.hwndTarget = a_wnd, d.dwFlags |= RIDEV_INPUTSINK;
+				bool  ok = g_realRegisterRawInput(&d, 1, sizeof(d)) != FALSE;
+				DWORD err = ok ? 0 : GetLastError();
+				int   was = g_sinkState.exchange(ok ? 1 : -1);
+				if (ok) g_sinkWindow = a_wnd, ++g_sinkAdds;
+				if (ok && was != 1) Log("mouse: the game's raw mouse now comes in the background too (flags %lx -> %lx): it turns Spider-Man's camera", from.dwFlags, d.dwFlags);
+				if (!ok && was != -1) Log("mouse: adding the background to the game's mouse registration failed (flags %lx -> %lx, error %lu)", from.dwFlags, d.dwFlags, err);
+			}
+		}
+		ReleaseSRWLockExclusive(&g_sinkLock);
+	}
+
+	// Window thread (g_sinkMsg 1: the host went): the game's own mouse registration back, if the one now is ours (or ours
+	// went with its window).
+	void RestoreMouseSink(HWND a_wnd)
+	{
+		RAWINPUTDEVICE m{};
+		bool           found = false;
+		AcquireSRWLockExclusive(&g_sinkLock);
+		if (g_sinkWindow && g_gameMouseKnown && g_realRegisterRawInput && RegisteredMouse(m, found) &&
+			(!found || (m.hwndTarget == g_sinkWindow && (m.dwFlags & RIDEV_INPUTSINK)))) {
+			RAWINPUTDEVICE d = g_gameMouse;
+			if (d.hwndTarget && !IsWindow(d.hwndTarget)) d.hwndTarget = a_wnd;  // its own window is gone: this one
+			bool ok = g_realRegisterRawInput(&d, 1, sizeof(d)) != FALSE;
+			if (ok) Log("mouse: no host - the game's own mouse registration is back (flags %lx)", d.dwFlags);
+			else Log("mouse: giving the game its own mouse registration back failed (error %lu)", GetLastError());
+		}
+		g_sinkWindow = nullptr;
+		g_sinkState = 0;
+		ReleaseSRWLockExclusive(&g_sinkLock);
+	}
+
+	// WM_INPUT that came only because of RIDEV_INPUTSINK: Spider-Man isn't in front.
+	LRESULT BackgroundInput(HWND a_wnd, WPARAM a_wp, LPARAM a_lp)
+	{
+		auto           h = reinterpret_cast<HRAWINPUT>(a_lp);
+		RAWINPUTHEADER hdr{};
+		UINT           size = sizeof(hdr);
+		if (!g_realGetRawInputData || GetRawInputData(h, RID_HEADER, &hdr, &size, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || hdr.dwType != RIM_TYPEMOUSE)
+			return CallWindowProcW(g_origWndProc, a_wnd, WM_INPUT, a_wp, a_lp);  // not the mouse's: as it came
+		if (!g_mouseLook.load(std::memory_order_relaxed)) {
+			g_mouseDropped.fetch_add(1, std::memory_order_relaxed);
+			return DefWindowProcW(a_wnd, WM_INPUT, a_wp, a_lp);
+		}
+		g_mouseMoves.fetch_add(1, std::memory_order_relaxed);
+		g_sinkInput.store(h, std::memory_order_relaxed);
+		LRESULT r = CallWindowProcW(g_origWndProc, a_wnd, WM_INPUT, RIM_INPUT, a_lp);
+		g_sinkInput.store(nullptr, std::memory_order_relaxed);
+		return r;
+	}
+
+	// The real mouse can reach his camera (kGuestMouseLook for the host): on, and the game's mouse comes in the background.
+	bool MouseLookReady() { return g_mouseLookOn.load(std::memory_order_relaxed) && g_sinkState.load(std::memory_order_relaxed) == 1 && g_realGetRawInputData; }
+
+	// Whether the real mouse turns his camera now (worker): Arkham in front - not the desktop or another program -
+	// and ticking (not loading), Spider-Man's camera in charge (no kPadCamera) and no fight.
+	bool MouseLookWanted(const proto::PadState& a_p, bool a_active)
+	{
+		if (!g_mouseLookOn.load(std::memory_order_relaxed) || !a_active || (a_p.flags & proto::kPadCamera) || combat::g_active) return false;
+		const proto::Header* hd = g_link.Header();
+		if (GetTickCount64() - hd->hostHeartbeatMs > 300) return false;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(GetForegroundWindow(), &pid);  // this DLL's import: the real one
+		return pid && pid == hd->hostPid;
+	}
+
 	// Pad -> keys, from the worker every 4 ms.
 	void PumpPadToKeys()
 	{
 		proto::PadState p{};
 		bool active = g_link.Valid() && SeqRead(g_link.Pad(), p) && (p.flags & proto::kPadActive);
+		g_mouseLook = MouseLookWanted(p, active);
 		constexpr int kDeadzone = 16000;
 		bool want[kKeyCount] = {};
 		if (active && (p.flags & proto::kPadAnalog)) {
@@ -531,6 +720,12 @@ namespace
 
 	LRESULT CALLBACK WndProcDetour(HWND a_wnd, UINT a_msg, WPARAM a_wp, LPARAM a_lp)
 	{
+		if (a_msg == WM_INPUT && GET_RAWINPUT_CODE_WPARAM(a_wp) == RIM_INPUTSINK) return BackgroundInput(a_wnd, a_wp, a_lp);  // the real mouse
+		if (a_msg == g_sinkMsg && g_sinkMsg) {
+			if (a_wp) RestoreMouseSink(a_wnd);
+			else EnsureMouseSink(a_wnd);
+			return 0;
+		}
 		if (g_fakeFocus) {
 			if ((a_msg == WM_ACTIVATEAPP && !a_wp) || (a_msg == WM_ACTIVATE && LOWORD(a_wp) == WA_INACTIVE) || a_msg == WM_KILLFOCUS) {
 				return 0;
@@ -893,6 +1088,7 @@ namespace
 	}
 
 	bool ReadCamera(float a_out[16]);
+	void OnCameraUpdated(void* a_this);
 
 	void RunCommand(char* a_line)
 	{
@@ -955,8 +1151,15 @@ namespace
 			if (!ReadHero(xf)) return;
 			g_tpTarget[0] = xf.pos[0] + atof(a2), g_tpTarget[1] = xf.pos[1] + atof(a3), g_tpTarget[2] = xf.pos[2] + atof(a4);
 			g_tpRequest = 2;
+		} else if (!_stricmp(c, "cam") && a1 && !_stricmp(a1, "mouse")) {
+			// cam mouse [on | off]: the real mouse turns Spider-Man's camera (his own mouse look)
+			if (a2) g_mouseLookOn = !_stricmp(a2, "on");
+			const char* reg = g_sinkState == 1 ? "comes in the background" : g_sinkState == -1 ? "CAN'T come in the background" : "doesn't come in the background yet";
+			Log("  mouse look %s (%s now); the game's raw mouse %s (re-added %u times); %llu moves passed to his camera, %llu dropped", g_mouseLookOn ? "on" : "off",
+				g_mouseLook ? "turning his camera" : "idle", reg, g_sinkAdds.load(), static_cast<unsigned long long>(g_mouseMoves.load()),
+				static_cast<unsigned long long>(g_mouseDropped.load()));
 		} else if (!_stricmp(c, "cam") && a1) {
-			// cam off | on | recal: the camera steering toward the host camera's yaw
+			// cam off | on | recal: the camera steering toward the host camera's yaw (while Arkham shows its own camera)
 			if (!_stricmp(a1, "recal")) g_steerRecal = true;
 			else g_steerEnabled = !_stricmp(a1, "on");
 			Log("  camera steering %s (sign %d, %.0f counts/rad)", !_stricmp(a1, "recal") ? "recalibrating" : g_steerEnabled ? "on" : "off", g_sign,
@@ -1044,7 +1247,9 @@ namespace
 		Log("settings hooks: RegQueryValueExW %s, RegQueryValueExA %s, RegGetValueA %s (VirtualPad=%d)", g_realRegQueryW ? "ok" : "MISSING",
 			g_realRegQueryA ? "ok" : "MISSING", g_realRegGetA ? "ok" : "MISSING", g_virtualPadSetting);
 		g_realGetRawInputData = reinterpret_cast<GetRawInputDataFn>(IatHook("USER32.dll", "GetRawInputData", reinterpret_cast<void*>(&GetRawInputDataDetour)));
-		Log("raw input hook: GetRawInputData %s", g_realGetRawInputData ? "ok" : "MISSING");
+		auto registerHook = reinterpret_cast<RegisterRawInputFn>(IatHook("USER32.dll", "RegisterRawInputDevices", reinterpret_cast<void*>(&RegisterRawInputDetour)));
+		g_realRegisterRawInput = registerHook ? registerHook : &RegisterRawInputDevices;  // not imported: the window thread adds the background (EnsureMouseSink)
+		Log("raw input hooks: GetRawInputData %s, RegisterRawInputDevices %s", g_realGetRawInputData ? "ok" : "MISSING", registerHook ? "ok" : "not imported");
 		gotham::Init();
 		g_origPreCollide = reinterpret_cast<PreCollideFn>(InlineHook(g_exe + kPreCollide, kPreCollideSig, sizeof(kPreCollideSig), reinterpret_cast<void*>(&PreCollideDetour)));
 		g_origCastRay = reinterpret_cast<Fn6>(InlineHook(g_exe + kCastRay, kCastRaySig, sizeof(kCastRaySig), reinterpret_cast<void*>(&CastRayDetour)));
@@ -1056,6 +1261,7 @@ namespace
 		zip::g_heroLocal = &g_heroLocal;
 		zip::Install();
 		mirror::Install(nullptr);  // Spider-Man takes Batman's pose (mirror.h); the pose slot comes with the link
+		combat::g_afterUpdate = &OnCameraUpdated;  // each frame's snapshot, right after its camera
 		combat::Install(&g_heroCamera);  // in fights Spider-Man's camera is Arkham's (combat.h)
 		int captured = CaptureThisOnVtable(g_exe + kHeroLocalVtable, kHeroLocalSlots, &g_heroLocal);
 		int camSlots = CaptureThisOnVtable(g_exe + kHeroCameraManagerVtable, kHeroCameraManagerSlots, &g_heroCamera);
@@ -1067,10 +1273,15 @@ namespace
 
 	// ---- snapshots: the hero and his camera from the same Spider-Man frame ------------------------------
 	// Spider-Man moves the hero, then the camera, then renders; sampling at an arbitrary moment can pair a
-	// new hero with last frame's camera (Batman then shakes against the view). So the transforms are
-	// watched every millisecond and a pair is taken once both have stopped changing for 2 ms - the frame's
-	// updates are done - stamped with the moment the frame's first change was seen (QPC, the same clock in
-	// both processes: the host interpolates between frames with it).
+	// new hero with last frame's camera (Batman then shakes against the view). The camera manager's update
+	// (combat.h hooks it; it writes the final camera once a frame) marks the frame: right after it the hero
+	// and the camera are taken together, stamped with that moment (QPC, the same clock in both processes: the
+	// host interpolates between frames with it).
+	//
+	// Without that hook (another build), or while the update doesn't run, the transforms are watched every
+	// millisecond instead and a pair is taken once both have stopped changing for 2 ms, stamped with the moment
+	// the frame's first change was seen. A camera written more than 2 ms after the hero splits that frame into
+	// two snapshots a few ms apart - the host copes, but the hook's are exact.
 	struct Snapshot
 	{
 		HeroXf  hero;
@@ -1078,9 +1289,11 @@ namespace
 		bool    camOk;
 		int64_t qpc;
 	};
-	SRWLOCK  g_snapLock = SRWLOCK_INIT;
-	Snapshot g_snap{};
-	bool     g_snapValid = false;
+	SRWLOCK                g_snapLock = SRWLOCK_INIT;
+	Snapshot               g_snap{};
+	bool                   g_snapValid = false;
+	std::atomic<ULONGLONG> g_camHookMs{ 0 };  // when the camera update hook last took one
+	int64_t                g_qpcPerSec = 1;
 
 	bool ReadCamera(float a_out[16])
 	{
@@ -1106,6 +1319,32 @@ namespace
 		if (ok) a_out = g_snap;
 		ReleaseSRWLockShared(&g_snapLock);
 		return ok;
+	}
+
+	// combat.h's camera update hook, on the game thread once a frame: the camera is final (in a fight Arkham's went in).
+	void OnCameraUpdated(void* a_this)
+	{
+		if (a_this != g_heroCamera) {  // another camera manager's update: not the frame's (the poller covers it if it's all there is)
+			static std::atomic<bool> s_logged{ false };
+			if (!s_logged.exchange(true)) Log("snapshots: a camera update for %p, not the hero's camera manager %p - skipped", a_this, g_heroCamera);
+			return;
+		}
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		Snapshot s{};
+		bool     hero = ReadHero(s.hero);
+		s.camOk = hero && ReadCamera(s.cam);
+		s.qpc = now.QuadPart;
+		AcquireSRWLockExclusive(&g_snapLock);
+		// called again within the same frame (nothing changed, under 4 ms later): not a new frame
+		bool again = hero && g_snapValid && now.QuadPart - g_snap.qpc < g_qpcPerSec / 250 && !memcmp(&s.hero, &g_snap.hero, sizeof(s.hero)) &&
+			!memcmp(s.cam, g_snap.cam, sizeof(s.cam));
+		if (!again) {
+			if (hero) g_snap = s;
+			g_snapValid = hero;
+		}
+		ReleaseSRWLockExclusive(&g_snapLock);
+		g_camHookMs.store(GetTickCount64(), std::memory_order_relaxed);
 	}
 
 	// The camera a captured frame was presented with, in the frame GuestState uses (capture.h).
@@ -1159,6 +1398,10 @@ namespace
 		int64_t changeQpc = 0;
 		for (;;) {
 			Sleep(1);
+			if (GetTickCount64() - g_camHookMs.load(std::memory_order_relaxed) < 250) {  // the camera update hook takes them
+				pending = false;
+				continue;
+			}
 			HeroXf h;
 			if (!ReadHero(h)) {
 				AcquireSRWLockExclusive(&g_snapLock);
@@ -1222,7 +1465,8 @@ namespace
 		Sample    grounded[8] = {};  // spots on Gotham where the hero stood still (for rescues)
 		unsigned  groundedNext = 0, lowReadings = 0;
 		double    lastSampleY = 0.0, lastSampleXZ[2] = {};
-		ULONGLONG lastSampleMs = 0, lastRescueMs = 0, stillSince = 0;
+		ULONGLONG lastSampleMs = 0, lastRescueMs = 0, stillSince = 0, lastSinkCheckMs = 0;
+		g_sinkMsg = RegisterWindowMessageW(L"ArkWeb.MouseSink");
 		for (uint64_t loop = 0;; ++loop) {
 			Sleep(4);
 			if (g_window && !IsWindow(g_window)) {
@@ -1235,10 +1479,12 @@ namespace
 					g_origWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&WndProcDetour)));
 					Log("game window %p (GameNxApp) subclassed", g_window);
 					if (g_fakeFocus) PostActivation();
+					if (!g_hostLinked && g_sinkMsg) PostMessageW(g_window, g_sinkMsg, 1, 0);  // a mouse registration of ours left from a link: back
 					capture::g_windowReady = true;
 				}
 			}
 			bool hostAlive = Link::Alive(g_link.Header()->hostHeartbeatMs);
+			if (g_hostLinked.exchange(hostAlive) && !hostAlive && g_window && g_sinkMsg) PostMessageW(g_window, g_sinkMsg, 1, 0);  // the game's mouse back
 			g_fakeFocus = g_forceFocus || hostAlive;
 			if (g_fakeFocus != wasFake) {
 				Log("fake focus %s (%s)", g_fakeFocus ? "ON" : "off", g_forceFocus ? "ForceFocus=1" : hostAlive ? "host linked" : "no host");
@@ -1248,6 +1494,11 @@ namespace
 
 			if (g_fakeFocus) HoldWindowActive();
 			if (g_realGetRawInputData) PumpPadToKeys();
+			// the real mouse: once a second while linked, the window thread makes sure the game's mouse comes in the background
+			if (hostAlive && g_window && g_sinkMsg && g_realGetRawInputData && GetTickCount64() - lastSinkCheckMs >= 1000) {
+				lastSinkCheckMs = GetTickCount64();
+				PostMessageW(g_window, g_sinkMsg, 0, 0);
+			}
 
 			HeroXf xf;
 			bool   inWorld = ReadHero(xf);
@@ -1327,7 +1578,8 @@ namespace
 			QueryPerformanceCounter(&now);
 			proto::GuestState gs{};
 			gs.flags = (inWorld ? proto::kGuestInWorld : 0) | (g_fakeFocus ? proto::kGuestFocusFaked : 0) |
-				(gotham::g_anchorValid ? proto::kGuestAnchored : 0) | (g_skyActive ? proto::kGuestSky : 0) | (g_jumpFailed ? proto::kGuestJumpFailed : 0);
+				(gotham::g_anchorValid ? proto::kGuestAnchored : 0) | (g_skyActive ? proto::kGuestSky : 0) | (g_jumpFailed ? proto::kGuestJumpFailed : 0) |
+				(MouseLookReady() ? proto::kGuestMouseLook : 0);
 			gs.frame = ++frame;
 			gs.qpc = now.QuadPart;
 			gs.tilesHeld = static_cast<uint32_t>(gotham::g_tilesHeld.load(std::memory_order_relaxed));
@@ -1402,9 +1654,10 @@ namespace
 			// Spider-Man's frames go to Arkham while he is on Gotham in the sky and Arkham is there (capture.h)
 			capture::g_autoWant = inWorld && g_skyActive && gotham::g_anchorValid && hostAlive;
 			if (inWorld && loop % 2500 == 0) {
-				Log("hero at %.2f %.2f %.2f m; XInput polls %llu, virtual pad served %llu, injected keys read %llu", gs.heroPos[0], gs.heroPos[1], gs.heroPos[2],
-					static_cast<unsigned long long>(g_padPolls.load()), static_cast<unsigned long long>(g_padServed.load()),
-					static_cast<unsigned long long>(g_fakeServed.load()));
+				Log("hero at %.2f %.2f %.2f m; XInput polls %llu, virtual pad served %llu, injected keys read %llu; mouse look %s, %llu moves passed, %llu dropped",
+					gs.heroPos[0], gs.heroPos[1], gs.heroPos[2], static_cast<unsigned long long>(g_padPolls.load()), static_cast<unsigned long long>(g_padServed.load()),
+					static_cast<unsigned long long>(g_fakeServed.load()), g_mouseLook ? "on" : "off", static_cast<unsigned long long>(g_mouseMoves.load()),
+					static_cast<unsigned long long>(g_mouseDropped.load()));
 			}
 		}
 	}
@@ -1422,6 +1675,9 @@ BOOL APIENTRY DllMain(HMODULE a_self, DWORD a_reason, LPVOID)
 		g_forceFocus = IniInt(a_self, L"ForceFocus", 0);
 		g_virtualPadSetting = IniInt(a_self, L"VirtualPad", 1);
 		Log("ArkWeb guest loaded (exe %p), ForceFocus=%d", reinterpret_cast<void*>(g_exe), g_forceFocus);
+		LARGE_INTEGER qpf;
+		QueryPerformanceFrequency(&qpf);
+		g_qpcPerSec = qpf.QuadPart;
 		InstallHooks();
 		capture::g_readCamera = &CaptureCamera;
 		capture::g_dumpExtra = &CaptureDumpExtra;

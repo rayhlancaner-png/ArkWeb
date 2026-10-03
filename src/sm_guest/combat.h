@@ -41,6 +41,7 @@ namespace arkweb::combat
 	using CamUpdateFn = uint64_t (*)(void*, float, uint64_t, uint64_t);
 	inline CamUpdateFn           g_origCamUpdate = nullptr;
 	inline void* volatile*       g_camManager = nullptr;  // main.cpp's g_heroCamera
+	inline void (*g_afterUpdate)(void*) = nullptr;        // main.cpp: the frame's snapshot (the camera is final here)
 	inline std::atomic<bool>     g_viewOn{ false };
 	inline SRWLOCK               g_viewLock = SRWLOCK_INIT;
 	inline float                 g_viewRows[3][3] = {};
@@ -63,6 +64,7 @@ namespace arkweb::combat
 				++g_viewWrites;
 			}
 		}
+		if (g_afterUpdate) g_afterUpdate(a_this);
 		return r;
 	}
 
