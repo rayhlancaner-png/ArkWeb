@@ -1,0 +1,111 @@
+# Builds ArkWeb on Windows with the repository's own build.bat (which runs the offline motion test too), runs the link
+# test, tries install.bat / uninstall.bat on a made-up Steam library and play.bat's Python checks, and keeps the two
+# DLLs in prebuilt/ - install.bat takes them from there, so ArkWeb installs without Visual Studio.
+name: build
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "protocol/**"
+      - "tests/**"
+      - "build.bat"
+      - "install.bat"
+      - "uninstall.bat"
+      - "play.bat"
+      - "tools/install.ps1"
+      - "tools/play.ps1"
+      - "tools/arkweb_state.py"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (build.bat, with the motion test)
+        shell: cmd
+        run: build.bat
+
+      - name: Link test
+        shell: cmd
+        run: bin\link_test.exe
+
+      - name: install.bat and uninstall.bat on a made-up Steam library
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lib = Join-Path $env:RUNNER_TEMP "Steam Library (x86)"
+          $ak = Join-Path $lib "steamapps\common\Batman Arkham Knight\Binaries\Win64"
+          $sm = Join-Path $lib "steamapps\common\Marvel's Spider-Man Remastered"
+          New-Item -ItemType Directory -Force -Path $ak, $sm | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $ak "BatmanAK.exe"), (Join-Path $sm "Spider-Man.exe") | Out-Null
+          Set-Content -LiteralPath (Join-Path $ak "dinput8.dll") -Value "another mod"  # set aside by install, back after uninstall
+          $steam = Join-Path $env:RUNNER_TEMP "Steam"
+          New-Item -ItemType Directory -Force -Path (Join-Path $steam "steamapps") | Out-Null
+          $vdf = "`"libraryfolders`"`n{`n`t`"0`"`n`t{`n`t`t`"path`"`t`t`"" + ($lib -replace '\\', '\\') + "`"`n`t}`n}`n"
+          Set-Content -LiteralPath (Join-Path $steam "steamapps\libraryfolders.vdf") -Value $vdf
+          New-Item -Path "HKCU:\Software\Valve\Steam" -Force | Out-Null
+          Set-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name SteamPath -Value ($steam -replace '\\', '/')
+          function Check($what, $ok) { if ($ok) { "ok: $what" } else { throw "FAILED: $what" } }
+          function Has($path, $text) { (Test-Path -LiteralPath $path) -and [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($path)).Contains($text) }
+          $logs = Join-Path $env:GITHUB_WORKSPACE "logs"
+
+          cmd /c install.bat -NoPause -NoAsk
+          Check "install exit code" ($LASTEXITCODE -eq 0)
+          Check "Arkham's DLL" (Has (Join-Path $ak "dinput8.dll") "ArkWeb")
+          Check "Spider-Man's DLL" (Has (Join-Path $sm "winmm.dll") "ArkWeb")
+          Check "the other mod's DLL set aside" (Has (Join-Path $ak "dinput8.dll.arkweb-backup") "another mod")
+          foreach ($d in $ak, $sm) {
+            $ini = Get-Content -LiteralPath (Join-Path $d "arkweb.ini")
+            Check "arkweb.ini in $d" (($ini -contains "[ArkWeb]") -and ($ini -contains "LogDir=$logs"))
+          }
+          Check "logs\stream" (Test-Path -LiteralPath (Join-Path $logs "stream"))
+
+          $before = (Get-Item -LiteralPath (Join-Path $sm "winmm.dll")).LastWriteTimeUtc
+          Start-Sleep -Seconds 2
+          cmd /c install.bat -IfNeeded -NoPause -NoAsk
+          Check "install -IfNeeded exit code" ($LASTEXITCODE -eq 0)
+          Check "install -IfNeeded left it alone" ((Get-Item -LiteralPath (Join-Path $sm "winmm.dll")).LastWriteTimeUtc -eq $before)
+
+          cmd /c uninstall.bat -NoPause -NoAsk
+          Check "uninstall exit code" ($LASTEXITCODE -eq 0)
+          Check "Spider-Man's DLL gone" (-not (Test-Path -LiteralPath (Join-Path $sm "winmm.dll")))
+          Check "the other mod's DLL back" (Has (Join-Path $ak "dinput8.dll") "another mod")
+          Check "arkweb.ini gone" (-not (Test-Path -LiteralPath (Join-Path $ak "arkweb.ini")) -and -not (Test-Path -LiteralPath (Join-Path $sm "arkweb.ini")))
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: play.bat's Python checks (packages, the streamer's imports)
+        shell: cmd
+        run: play.bat -Check
+
+      - name: tools/arkweb_state.py (no games running)
+        shell: cmd
+        run: cd tools && python arkweb_state.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArkWeb-dlls
+          path: |
+            bin/ak/dinput8.dll
+            bin/sm/winmm.dll
+
+      - name: Keep the DLLs in prebuilt/
+        shell: bash
+        run: |
+          mkdir -p prebuilt
+          cp bin/ak/dinput8.dll bin/sm/winmm.dll prebuilt/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add prebuilt
+          if git diff --cached --quiet; then echo "prebuilt/ unchanged"; exit 0; fi
+          git commit -m "prebuilt: DLLs built from ${GITHUB_SHA::7}"
+          git push origin "HEAD:${GITHUB_REF_NAME}" || { git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; }

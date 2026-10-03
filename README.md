@@ -54,14 +54,24 @@ same pose transfer in Python, for checking it offline.
   builds refuse to hook.
 - **Batman: Arkham Knight** (Steam)
 - An Xbox-style controller, or a keyboard and mouse
-- Visual Studio 2019 Build Tools (x64 C++) and the Windows 10 SDK (for `fxc`)
-- Python 3.12 with `numpy`, `scipy`, `numba`, `pefile` and `capstone` (for the streamer and tools)
+- Python 3.12 with `numpy`, `scipy`, `numba`, `pefile` and `capstone` (for the streamer and tools). `play.bat`
+  installs the packages, and Python itself with winget if you say so.
+- Only to build the DLLs yourself: Visual Studio 2019 or later (the Build Tools are enough) with the x64 C++ tools
+  and a Windows SDK (for `fxc`). Without it the DLLs come from `prebuilt\`.
 
-## Build and install
+## Install
 
-1. Edit the game paths in `install.bat` and `uninstall.bat`.
-2. Run `build.bat`. It builds both DLLs and the tests into `bin\`, at low priority on one core.
-3. Close both games, then run `install.bat`. `uninstall.bat` removes the DLLs again.
+1. Get this repository onto your PC: clone it, or Code → Download ZIP and unpack it anywhere.
+2. Close both games and double-click `install.bat`. It finds both games in your Steam libraries (or asks for the
+   folder), puts the DLLs next to them and points their logs at this folder's `logs\`, where the streamer works too.
+   Games in Program Files need administrator rights: Windows asks. A `dinput8.dll` or `winmm.dll` of another mod is
+   kept aside, and `uninstall.bat` puts it back when it takes ArkWeb out.
+
+`play.bat` does this step by itself when the games don't have this version yet.
+
+The DLLs come from `bin\` when you build them yourself with `build.bat` (both DLLs and the tests, at low priority
+on one core) and they are newer, else from `prebuilt\`, which GitHub Actions builds from this source
+(`.github/workflows/build.yml`).
 
 `arkweb.ini` next to either DLL can override `[ArkWeb] LogDir=` and a few switches (see `PHASE1.md`).
 Logs go to `logs\`.
@@ -70,11 +80,13 @@ Logs go to `logs\`.
 
 ## Playing
 
-1. Start both games and load into the open world in each. Keep Arkham Knight in front.
-2. Stand still with Spider-Man, then start the streamer: `cd tools` and `python gotham_stream.py`.
-   It waits for both games, builds the area around you and lifts Spider-Man onto Gotham.
-3. Play with the controller, or keyboard and mouse. If you restart the streamer while still in game, use
-   `--resume`.
+1. Double-click `play.bat`. It installs ArkWeb if needed, checks Python and the streamer's packages, starts both
+   games through Steam and then the streamer (`tools\gotham_stream.py`). Keep its window open while you play.
+2. Load into the open world in each game, Batman on a street. Keep Arkham Knight in front.
+3. Stand still with Spider-Man for a few seconds: the streamer builds the area around you and lifts Spider-Man
+   onto Gotham.
+4. Play with the controller, or keyboard and mouse. `play.bat` started again mid-session resumes the streamer
+   (`--resume`).
 
 ### Keyboard and mouse
 
@@ -127,6 +139,8 @@ go to `logs\sm_guest.log` and `logs\ak_host.log`.
 | Path | Contents |
 |---|---|
 | `src/`, `protocol/` | The two DLLs and the shared link |
+| `install.bat`, `uninstall.bat`, `play.bat` | Install into both games, take it out again, play (`tools/install.ps1`, `tools/play.ps1`) |
+| `prebuilt/` | The two DLLs, built from this source by GitHub Actions |
 | `tools/` | The streamer and reverse-engineering scripts (`tools/README.md`) |
 | `tests/` | Offline link and motion-smoothing tests |
 | `recon/PHASE0*.md`, `PHASE1.md`, `PHASE2.md` | Findings and phase notes, with addresses |

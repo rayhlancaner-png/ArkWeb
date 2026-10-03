@@ -1,11 +1,23 @@
 @echo off
 rem Builds the ArkWeb DLLs and tests into bin\ (one compiler at a time, low priority, one core).
+rem Needs Visual Studio 2019 or later - the Build Tools are enough - with the x64 C++ tools and a Windows SDK.
 setlocal
 cd /d "%~dp0"
-call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul || exit /b 1
+set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSDIR="
+if exist "%VSWHERE%" "%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%TEMP%\arkweb_vs.txt" 2>nul
+if exist "%TEMP%\arkweb_vs.txt" set /p VSDIR=<"%TEMP%\arkweb_vs.txt"
+if defined VSDIR if exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" echo No Visual Studio with the x64 C++ tools found: install the Build Tools for Visual Studio with "Desktop development with C++".
+if not exist "%VCVARS%" exit /b 1
+call "%VCVARS%" >nul 2>nul || exit /b 1
 for %%d in (bin bin\obj\ak bin\obj\sm bin\obj\test bin\ak bin\sm) do if not exist %%d mkdir %%d
 del /q bin\ak\dinput8.dll bin\sm\winmm.dll bin\link_test.exe bin\motion_test.exe src\sm_guest\capture_cs.h src\ak_host\overlay_vs.h src\ak_host\overlay_ps.h 2>nul
-set FXC=C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\fxc.exe
+rem fxc comes with the Windows SDK, which vcvars puts on the PATH
+set "FXC="
+for /f "delims=" %%f in ('where fxc.exe 2^>nul') do if not defined FXC set "FXC=%%f"
+if not defined FXC set "FXC=C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\fxc.exe"
 start "" /low /affinity 1 /wait /b "%FXC%" /nologo /T cs_5_0 /E main /O3 /Vn g_captureCs /Fh src\sm_guest\capture_cs.h src\sm_guest\capture_cs.hlsl
 if not exist src\sm_guest\capture_cs.h exit /b 1
 start "" /low /affinity 1 /wait /b "%FXC%" /nologo /T vs_5_0 /E vs /O3 /Vn g_overlayVs /Fh src\ak_host\overlay_vs.h src\ak_host\overlay.hlsl

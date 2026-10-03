@@ -1,3 +1,3 @@
 @echo off
-del "H:\SteamLibrary\steamapps\common\Marvel's Spider-Man Remastered\winmm.dll"
-del "F:\SteamLibrary\steamapps\common\Batman Arkham Knight\Binaries\Win64\dinput8.dll"
+rem Takes ArkWeb out of both games again; a DLL of another mod it had set aside goes back (tools\install.ps1).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\install.ps1" -Uninstall %*
